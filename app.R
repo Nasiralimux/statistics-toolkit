@@ -12,12 +12,11 @@
 # ============================================================
 # 1. LIBRARIES
 # ============================================================
-
+library(glmnet)
 library(shiny)
 library(readxl)
 library(haven)
 library(ggplot2)
-library(glmnet)   # ridge regression
 
 
 # ============================================================
@@ -26,6 +25,8 @@ library(glmnet)   # ridge regression
 
 ACCENT <- "#1D6F8A"
 MAX_AUTO_CORR_VARS <- 12   # cap for "Automatic" correlation matrix
+MAX_AUTO_MV_VARS   <- 15   # cap for "Automatic" multivariate analysis
+VIF_FLAG_THRESHOLD <- 5    # VIF at/above this triggers the ridge-regression option
 
 STAT_FUNS <- list(Mean = mean, Median = median, Sum = sum,
                   Minimum = min, Maximum = max)
@@ -46,6 +47,21 @@ CHARTS <- list(
   "Density Plot"                          = c(cat = 0, num = 1),
   "Scatter Plot"                          = c(cat = 0, num = 2),
   "Line Chart"                            = c(cat = 0, num = 2)
+)
+
+# Minimum categorical / numeric variables each hypothesis test needs.
+TESTS <- list(
+  "One-Sample t-test"  = c(cat = 0, num = 1),
+  "Independent t-test" = c(cat = 1, num = 1),
+  "Paired t-test"      = c(cat = 0, num = 2),
+  "Chi-Square Test"    = c(cat = 2, num = 0)
+)
+
+# Minimum categorical / numeric variables each non-parametric test needs.
+NP_TESTS <- list(
+  "Mann-Whitney U (2 groups)"     = c(cat = 1, num = 1),
+  "Kruskal-Wallis (3+ groups)"    = c(cat = 1, num = 1),
+  "Wilcoxon Signed-Rank (paired)" = c(cat = 0, num = 2)
 )
 
 app_css <- "
@@ -104,7 +120,8 @@ alert <- function(type, title, msg = "") {
 run_button <- function(id, label) actionButton(id, label, icon = icon("play"), class = "btn-primary")
 
 # Automatic / Manual switch; `manual` is the UI shown in manual mode,
-# `<id>_auto` is a uiOutput describing the automatic rule.
+# `<id>_auto` is a uiOutput describing the automatic rule. `manual` may
+# itself be a uiOutput() when the manual UI depends on other inputs.
 var_panel <- function(id, manual) {
   mode <- paste0(id, "_mode")
   tagList(
@@ -130,6 +147,16 @@ strength <- function(r) {
 
 theme_app <- theme_minimal(base_size = 13) + theme(plot.title = element_text(face = "bold"))
 
+# Build a two-column, complete-cases data frame for a numeric variable `x`
+# grouped by categorical variable `g` (used by t-tests, ANOVA, non-parametric
+# tests). `g` is coerced to a factor with unused levels dropped.
+grouped_xy <- function(df, x, g) {
+  d <- df[c(x, g)]
+  d <- d[complete.cases(d), ]
+  d[[g]] <- droplevels(as.factor(d[[g]]))
+  d
+}
+
 # ---- One plotting function for every chart ----------------
 # `measures` is only used by "Grouped Bar Chart (Multiple Measures)": a
 # character vector of 2+ numeric column names to compare side by side
@@ -138,7 +165,7 @@ theme_app <- theme_minimal(base_size = 13) + theme(plot.title = element_text(fac
 plot_chart <- function(type, df, x, y = NULL, group = NULL, stat = "Mean", bins = 30,
                        measures = NULL) {
   if (is.null(bins) || is.na(bins)) bins <- 30
-
+  
   p <- switch(type,
               "Histogram" = ggplot(df, aes(.data[[x]])) +
                 geom_histogram(bins = bins, fill = ACCENT, colour = "white", na.rm = TRUE) +
@@ -223,7 +250,7 @@ plot_chart <- function(type, df, x, y = NULL, group = NULL, stat = "Mean", bins 
               
               stop("Unknown chart type: ", type)
   )
-
+  
   p <- p + theme_app
   if (type == "Pie Chart") {
     p <- p + theme(axis.text = element_blank(), axis.ticks = element_blank(),
@@ -257,33 +284,26 @@ fit_lm <- function(df, dv, ivs) {
   lm(f, data = md)
 }
 
+# Same validity checks as fit_lm(), for a binary (two-level) outcome.
 fit_logit <- function(df, dv, ivs) {
   validate(
     need(length(dv) == 1 && length(ivs) >= 1,
-         "Select one binary dependent variable and at least one independent variable."),
+         "Select one dependent variable and at least one independent variable."),
     need(!(dv %in% ivs), "The dependent variable cannot also be an independent variable.")
   )
   vars <- c(dv, ivs)
   md <- df[complete.cases(df[vars]), vars, drop = FALSE]
-  
+  md[[dv]] <- as.factor(md[[dv]])
+  validate(need(nlevels(md[[dv]]) == 2, "The dependent variable must have exactly two levels."))
   validate(need(nrow(md) > length(ivs) + 1,
                 "Not enough complete observations relative to the number of model parameters."))
-  
-  lvl <- sort(unique(as.character(md[[dv]])))
-  validate(need(length(lvl) == 2,
-                paste("The dependent variable must have exactly two categories. Found:",
-                      paste(lvl, collapse = ", "))))
-  md[[dv]] <- factor(as.character(md[[dv]]), levels = lvl)
-  
   flat <- ivs[vapply(md[ivs], function(x) length(unique(x)) <= 1, logical(1))]
   validate(need(!length(flat),
                 paste("Insufficient variation in:", paste(flat, collapse = ", "))))
-  
-  f <- reformulate(ivs, response = dv)
-  m <- glm(f, data = md, family = binomial())
-  list(model = m, positive_level = lvl[2], reference_level = lvl[1], data = md, dv = dv)
+  glm(reformulate(ivs, dv), data = md, family = binomial())
 }
 
+# Works for both lm and glm fits (model.matrix() is generic).
 calc_vif <- function(model) {
   x <- model.matrix(model)
   x <- x[, colnames(x) != "(Intercept)", drop = FALSE]
@@ -316,6 +336,17 @@ vif_alert <- function(v) {
   } else {
     alert("success", "No substantial multicollinearity detected.")
   }
+}
+
+# Ridge regression (glmnet, alpha = 0) fitted on the same design matrix as an
+# already-fitted lm model. Only meant to be called when VIF has flagged
+# multicollinearity; not a general-purpose fitting routine.
+fit_ridge <- function(model) {
+  x <- model.matrix(model)[, -1, drop = FALSE]
+  y <- model.response(model.frame(model))
+  nf <- max(3, min(10, nrow(x)))
+  cvfit <- cv.glmnet(x, y, alpha = 0, standardize = TRUE, nfolds = nf)
+  list(lambda = cvfit$lambda.min, coef = as.matrix(coef(cvfit, s = "lambda.min")))
 }
 
 # ---- Correlation helpers ----------------------------------
@@ -354,6 +385,48 @@ pair_matrix <- function(pairs, vars, col, diag_value = NA_real_) {
   m
 }
 
+# ---- Outlier detection helpers -----------------------------
+
+outlier_bounds <- function(x, method = "IQR") {
+  x <- x[is.finite(x)]
+  if (method == "IQR") {
+    q <- quantile(x, c(.25, .75), na.rm = TRUE); iqr <- diff(q)
+    c(lower = q[[1]] - 1.5 * iqr, upper = q[[2]] + 1.5 * iqr)
+  } else {
+    m <- mean(x); s <- sd(x)
+    c(lower = m - 3 * s, upper = m + 3 * s)
+  }
+}
+
+outlier_summary <- function(df, vars, method = "IQR") {
+  do.call(rbind, lapply(vars, function(v) {
+    x <- df[[v]]; xf <- x[is.finite(x)]
+    b <- outlier_bounds(xf, method)
+    flag <- is.finite(x) & (x < b[["lower"]] | x > b[["upper"]])
+    data.frame(Variable = v, N = length(xf), N_Outliers = sum(flag),
+               Pct_Outliers = round(100 * sum(flag) / max(1, length(xf)), 2),
+               Lower_Bound = round(b[["lower"]], 3), Upper_Bound = round(b[["upper"]], 3))
+  }))
+}
+
+# ---- Reliability (Cronbach's alpha) helper -----------------
+
+cronbach_alpha <- function(df) {
+  df <- df[complete.cases(df), , drop = FALSE]
+  k <- ncol(df)
+  item_var <- vapply(df, var, numeric(1))
+  total_var <- var(rowSums(df))
+  a <- (k / (k - 1)) * (1 - sum(item_var) / total_var)
+  it  <- vapply(seq_len(k), function(i) cor(df[[i]], rowSums(df[-i])), numeric(1))
+  aid <- vapply(seq_len(k), function(i) {
+    sub <- df[-i]; kk <- ncol(sub)
+    (kk / (kk - 1)) * (1 - sum(vapply(sub, var, numeric(1))) / var(rowSums(sub)))
+  }, numeric(1))
+  list(alpha = a, n = nrow(df), k = k,
+       items = data.frame(Item = names(df), Item_Total_Cor = round(it, 3),
+                          Alpha_If_Dropped = round(aid, 3)))
+}
+
 
 # ============================================================
 # 4. USER INTERFACE
@@ -367,7 +440,7 @@ welcome_panel <- div(
       stat_tile("Overview", "Preview data and variable types"),
       stat_tile("Descriptives", "Summaries for every variable"),
       stat_tile("Visualizations", "Recommended and custom charts"),
-      stat_tile("Statistical tools", "Normality, regression, correlation"))
+      stat_tile("Statistical tools", "Normality, regression, correlation and more"))
 )
 
 ui <- fluidPage(
@@ -436,7 +509,7 @@ ui <- fluidPage(
           tabsetPanel(
             id = "tools_tab", type = "tabs",
             
-            # ---- Normality ----
+            # ---- 1. Normality ----
             tabPanel(
               "Normality Check", br(),
               panel_card("Normality Check Setup",
@@ -446,7 +519,7 @@ ui <- fluidPage(
               uiOutput("norm_results_ui")
             ),
             
-            # ---- Regression ----
+            # ---- 2. Regression (+ ridge when collinearity is flagged) ----
             tabPanel(
               "Regression Analysis", br(),
               panel_card("Linear Regression Setup",
@@ -461,7 +534,7 @@ ui <- fluidPage(
               uiOutput("reg_results_ui")
             ),
             
-            # ---- Correlation ----
+            # ---- 3. Correlation ----
             tabPanel(
               "Correlation Analysis", br(),
               panel_card("Correlation Setup",
@@ -477,42 +550,112 @@ ui <- fluidPage(
               uiOutput("cor_results_ui")
             ),
             
-            # ---- Logistic Regression ----
+            # ---- 4. Logistic Regression ----
             tabPanel(
               "Logistic Regression", br(),
               panel_card("Logistic Regression Setup",
-                         var_panel("logit", tagList(
-                           selectInput("logit_dv", "Dependent variable (2 categories):", choices = NULL),
-                           selectizeInput("logit_iv", "Independent variable(s):", choices = NULL,
+                         var_panel("log", tagList(
+                           selectInput("log_dv", "Dependent variable (binary):", choices = NULL),
+                           selectizeInput("log_iv", "Independent variable(s):", choices = NULL,
                                           multiple = TRUE,
                                           options = list(plugins = list("remove_button"))))),
-                         run_button("logit_run", "Run Logistic Regression"),
-                         uiOutput("logit_msg")),
-              uiOutput("logit_results_ui")
+                         run_button("log_run", "Run Logistic Regression"),
+                         uiOutput("log_msg")),
+              uiOutput("log_results_ui")
             ),
             
-            # ---- Testing (t-tests) ----
+            # ---- 5. Hypothesis Testing ----
             tabPanel(
               "Testing", br(),
-              panel_card("Test Setup",
-                         selectInput("test_type", "Test type:",
-                                     c("One-Sample t-test", "Independent Samples t-test", "Paired t-test")),
-                         uiOutput("test_vars_ui"),
+              panel_card("Hypothesis Test Setup",
+                         fluidRow(
+                           column(6, selectInput("test_type", "Test:", names(TESTS))),
+                           column(6, conditionalPanel(
+                             "input.test_type == 'One-Sample t-test'",
+                             numericInput("test_mu", "Test value (\u03bc):", 0)))),
+                         var_panel("test", uiOutput("test_manual_ui")),
                          run_button("test_run", "Run Test"),
                          uiOutput("test_msg")),
               uiOutput("test_results_ui")
             ),
             
-            # ---- ANOVA ----
+            # ---- 6. ANOVA ----
             tabPanel(
               "ANOVA", br(),
               panel_card("One-Way ANOVA Setup",
                          var_panel("anova", tagList(
-                           selectInput("anova_dv", "Numeric (dependent) variable:", choices = NULL),
-                           selectInput("anova_factor", "Categorical factor:", choices = NULL))),
+                           selectInput("anova_y", "Numeric (dependent) variable:", choices = NULL),
+                           selectInput("anova_g", "Grouping (factor) variable:", choices = NULL))),
                          run_button("anova_run", "Run ANOVA"),
                          uiOutput("anova_msg")),
               uiOutput("anova_results_ui")
+            ),
+            
+            # ---- 7. Non-Parametric Tests ----
+            tabPanel(
+              "Non-Parametric", br(),
+              panel_card("Non-Parametric Test Setup",
+                         selectInput("np_type", "Test:", names(NP_TESTS)),
+                         var_panel("np", uiOutput("np_manual_ui")),
+                         run_button("np_run", "Run Test"),
+                         uiOutput("np_msg")),
+              uiOutput("np_results_ui")
+            ),
+            
+            # ---- 8. Time Series ----
+            tabPanel(
+              "Time Series", br(),
+              panel_card("Time Series Setup",
+                         var_panel("ts", tagList(
+                           selectInput("ts_var", "Numeric (value) variable:", choices = NULL),
+                           selectInput("ts_time", "Time / date variable (optional):", choices = NULL),
+                           numericInput("ts_freq",
+                                        "Seasonal frequency (1 = none, 12 = monthly, 4 = quarterly, 7 = weekly):",
+                                        1, 1, 365))),
+                         run_button("ts_run", "Run Time Series Analysis"),
+                         uiOutput("ts_msg")),
+              uiOutput("ts_results_ui")
+            ),
+            
+            # ---- 9. Reliability Analysis ----
+            tabPanel(
+              "Reliability Analysis", br(),
+              panel_card("Reliability (Cronbach's Alpha) Setup",
+                         var_panel("rel", selectizeInput("rel_items", "Scale items (numeric, 2 or more):",
+                                                         choices = NULL, multiple = TRUE,
+                                                         options = list(plugins = list("remove_button")))),
+                         run_button("rel_run", "Run Reliability Analysis"),
+                         uiOutput("rel_msg")),
+              uiOutput("rel_results_ui")
+            ),
+            
+            # ---- 10. Multivariate Analysis ----
+            tabPanel(
+              "Multivariate Analysis", br(),
+              panel_card("Principal Component Analysis & Clustering Setup",
+                         var_panel("mv", selectizeInput("mv_vars", "Numeric variables (2 or more):",
+                                                        choices = NULL, multiple = TRUE,
+                                                        options = list(plugins = list("remove_button")))),
+                         fluidRow(
+                           column(6, checkboxInput("mv_scale", "Standardize variables (recommended)", TRUE)),
+                           column(6, numericInput("mv_k", "Number of clusters (k):", 3, 2, 10))),
+                         run_button("mv_run", "Run Multivariate Analysis"),
+                         uiOutput("mv_msg")),
+              uiOutput("mv_results_ui")
+            ),
+            
+            # ---- 11. Outlier Detection ----
+            tabPanel(
+              "Outlier Detection", br(),
+              panel_card("Outlier Detection Setup",
+                         var_panel("out", selectizeInput("out_vars", "Numeric variable(s):", choices = NULL,
+                                                         multiple = TRUE,
+                                                         options = list(plugins = list("remove_button")))),
+                         radioButtons("out_method", "Method:",
+                                      c("IQR (1.5\u00d7)" = "IQR", "Z-score (|z| > 3)" = "Z"), inline = TRUE),
+                         run_button("out_run", "Detect Outliers"),
+                         uiOutput("out_msg")),
+              uiOutput("out_results_ui")
             )
           )
         )
@@ -563,10 +706,15 @@ server <- function(input, output, session) {
     numeric     <- flag(is.numeric)
     categorical <- flag(function(x) is.character(x) || is.factor(x) || is.logical(x))
     date        <- flag(function(x) inherits(x, c("Date", "POSIXct", "POSIXlt")))
-    binary      <- categorical[vapply(df[categorical], function(x)
-                    length(unique(x[!is.na(x)])) == 2, logical(1))]
-    list(numeric = numeric, categorical = categorical, date = date, binary = binary,
+    list(numeric = numeric, categorical = categorical, date = date,
          other = setdiff(nm, c(numeric, categorical, date)))
+  })
+  
+  # Any column (of any type) with exactly two distinct non-missing values;
+  # used as the candidate outcome list for logistic regression.
+  binary_vars <- reactive({
+    df <- req(data())
+    names(df)[vapply(df, function(x) length(unique(x[!is.na(x)])) == 2, logical(1))]
   })
   
   output$file_info <- renderUI({
@@ -821,69 +969,63 @@ server <- function(input, output, session) {
   # Keep the manual variable lists in sync with the dataset
   observe({
     num <- types()$numeric
+    cat <- types()$categorical
     updateSelectInput(session, "norm_var", choices = num)
     updateSelectInput(session, "reg_dv", choices = num)
     updateSelectInput(session, "cor_vars", choices = num)
-    updateSelectInput(session, "anova_dv", choices = num)
+    updateSelectInput(session, "log_dv", choices = binary_vars())
+    updateSelectInput(session, "anova_y", choices = num)
+    updateSelectInput(session, "anova_g", choices = cat)
+    updateSelectInput(session, "ts_var", choices = num)
+    updateSelectInput(session, "ts_time", choices = c("(row order)" = "", types()$date, num))
+    updateSelectizeInput(session, "rel_items", choices = num)
+    updateSelectizeInput(session, "mv_vars", choices = num)
+    updateSelectizeInput(session, "out_vars", choices = num)
   })
   
-  observe({
-    updateSelectInput(session, "logit_dv", choices = types()$binary)
-    updateSelectizeInput(session, "logit_iv", choices = types()$numeric,
-                         selected = intersect(isolate(input$logit_iv), types()$numeric))
-  })
-  
-  observe({
-    updateSelectInput(session, "anova_factor", choices = types()$categorical)
-  })
-  
-  # Regression predictors exclude the chosen dependent variable
+  # Regression / logistic-regression predictors exclude the chosen outcome
   observe({
     ivs <- setdiff(types()$numeric, input$reg_dv)
     updateSelectInput(session, "reg_iv", choices = ivs,
                       selected = intersect(isolate(input$reg_iv), ivs))
+  })
+  observe({
+    ivs <- setdiff(c(types()$numeric, types()$categorical), input$log_dv)
+    updateSelectizeInput(session, "log_iv", choices = ivs,
+                         selected = intersect(isolate(input$log_iv), ivs))
   })
   
   observeEvent(input$cor_all, {
     updateSelectInput(session, "cor_vars", selected = types()$numeric)
   })
   
-  # Warning shown when the dataset cannot support a tool
-  min_vars_msg <- function(k, tool) {
-    if (length(types()$numeric) < k) {
-      alert("danger", paste(tool, "unavailable:"),
-            paste("the dataset must contain at least", k, "numeric variable(s)."))
+  # Warning shown when the dataset cannot support a tool. Replaces the
+  # dataset-specific checks each tool used to duplicate.
+  avail_msg <- function(tool, need_num = 0, need_cat = 0, need_bin = 0) {
+    t <- types()
+    if (length(t$numeric) < need_num || length(t$categorical) < need_cat ||
+        length(binary_vars()) < need_bin) {
+      req_txt <- paste(c(
+        if (need_num) paste(need_num, "numeric"),
+        if (need_cat) paste(need_cat, "categorical"),
+        if (need_bin) paste(need_bin, "binary")
+      ), collapse = " and ")
+      return(alert("danger", paste0(tool, " unavailable:"),
+                   paste("the dataset must contain at least", req_txt, "variable(s).")))
     }
+    NULL
   }
-  output$norm_msg <- renderUI(min_vars_msg(1, "Normality Check"))
-  output$reg_msg  <- renderUI(min_vars_msg(2, "Linear Regression"))
-  output$cor_msg  <- renderUI(min_vars_msg(2, "Correlation Analysis"))
-  
-  output$logit_msg <- renderUI({
-    if (length(types()$binary) < 1 || length(types()$numeric) < 1) {
-      alert("danger", "Logistic Regression unavailable:",
-            "the dataset must contain at least one two-category variable and one numeric variable.")
-    }
-  })
-  
-  output$test_msg <- renderUI({
-    if (length(types()$numeric) < 1) {
-      alert("danger", "Testing unavailable:", "the dataset must contain at least one numeric variable.")
-    } else if (input$test_type == "Independent Samples t-test" && length(types()$binary) < 1) {
-      alert("danger", "Independent Samples t-test unavailable:",
-            "the dataset must contain a two-category grouping variable.")
-    } else if (input$test_type == "Paired t-test" && length(types()$numeric) < 2) {
-      alert("danger", "Paired t-test unavailable:",
-            "the dataset must contain at least two numeric variables.")
-    }
-  })
-  
-  output$anova_msg <- renderUI({
-    if (length(types()$numeric) < 1 || length(types()$categorical) < 1) {
-      alert("danger", "ANOVA unavailable:",
-            "the dataset must contain at least one numeric variable and one categorical variable.")
-    }
-  })
+  output$norm_msg  <- renderUI(avail_msg("Normality Check", need_num = 1))
+  output$reg_msg   <- renderUI(avail_msg("Linear Regression", need_num = 2))
+  output$cor_msg   <- renderUI(avail_msg("Correlation Analysis", need_num = 2))
+  output$log_msg   <- renderUI(avail_msg("Logistic Regression", need_bin = 1))
+  output$test_msg  <- renderUI(avail_msg("Hypothesis Testing", need_num = 1))
+  output$anova_msg <- renderUI(avail_msg("ANOVA", need_num = 1, need_cat = 1))
+  output$np_msg    <- renderUI(avail_msg("Non-Parametric Tests", need_num = 1))
+  output$ts_msg    <- renderUI(avail_msg("Time Series Analysis", need_num = 1))
+  output$rel_msg   <- renderUI(avail_msg("Reliability Analysis", need_num = 2))
+  output$mv_msg    <- renderUI(avail_msg("Multivariate Analysis", need_num = 2))
+  output$out_msg   <- renderUI(avail_msg("Outlier Detection", need_num = 1))
   
   # Description of the automatic selection rule for each tool
   output$norm_auto <- renderUI({
@@ -910,29 +1052,81 @@ server <- function(input, output, session) {
             tags$br(), tags$b("Selected variables: "), paste(v, collapse = ", "))
   })
   
-  output$logit_auto <- renderUI({
-    bin <- types()$binary
-    num <- types()$numeric
-    req(length(bin) >= 1, length(num) >= 1)
+  output$log_auto <- renderUI({
+    v <- binary_vars(); n <- types()$numeric
+    req(length(v) >= 1)
     tagList(tags$b("Automatic rule: "),
-            "the first two-category variable is the outcome; all numeric variables are predictors.",
-            tags$br(), tags$b("Dependent variable: "), bin[1],
-            tags$br(), tags$b("Independent variable(s): "), paste(num, collapse = ", "))
+            "the first binary variable is the outcome; all numeric variables are predictors.",
+            tags$br(), tags$b("Dependent variable: "), v[1],
+            tags$br(), tags$b("Independent variable(s): "), paste(setdiff(n, v[1]), collapse = ", "))
+  })
+  
+  output$test_auto <- renderUI({
+    n <- types()$numeric; k <- types()$categorical; type <- input$test_type
+    req(type)
+    need_v <- TESTS[[type]]
+    req(length(k) >= need_v["cat"], length(n) >= need_v["num"])
+    desc <- switch(type,
+      "One-Sample t-test"  = sprintf("Testing %s against \u03bc = %s.", n[1], input$test_mu),
+      "Independent t-test" = sprintf("Comparing %s across the two groups of %s.", n[1], k[1]),
+      "Paired t-test"      = sprintf("Comparing %s and %s (paired).", n[1], n[min(2, length(n))]),
+      "Chi-Square Test"    = sprintf("Testing independence between %s and %s.", k[1], k[min(2, length(k))])
+    )
+    tagList(tags$b("Automatic rule: "), desc)
   })
   
   output$anova_auto <- renderUI({
-    num <- types()$numeric
-    cat <- types()$categorical
-    req(length(num) >= 1, length(cat) >= 1)
+    n <- types()$numeric; k <- types()$categorical
+    req(length(n) >= 1, length(k) >= 1)
+    tagList(tags$b("Automatic rule: "), "the first numeric variable is compared across the first categorical variable.",
+            tags$br(), tags$b("Dependent variable: "), n[1], tags$br(), tags$b("Grouping variable: "), k[1])
+  })
+  
+  output$np_auto <- renderUI({
+    n <- types()$numeric; k <- types()$categorical; type <- input$np_type
+    req(type)
+    need_v <- NP_TESTS[[type]]
+    req(length(k) >= need_v["cat"], length(n) >= need_v["num"])
+    desc <- if (type == "Wilcoxon Signed-Rank (paired)") {
+      sprintf("Comparing %s and %s (paired).", n[1], n[min(2, length(n))])
+    } else {
+      sprintf("Comparing %s across the groups of %s.", n[1], k[1])
+    }
+    tagList(tags$b("Automatic rule: "), desc)
+  })
+  
+  output$ts_auto <- renderUI({
+    n <- types()$numeric
+    req(length(n) >= 1)
     tagList(tags$b("Automatic rule: "),
-            "the first numeric variable is compared across the levels of the first categorical variable.",
-            tags$br(), tags$b("Dependent variable: "), num[1],
-            tags$br(), tags$b("Factor: "), cat[1])
+            "the first numeric variable is analyzed in row order (or by the first date variable, if present).",
+            tags$br(), tags$b("Variable: "), n[1])
+  })
+  
+  output$rel_auto <- renderUI({
+    n <- types()$numeric
+    req(length(n) >= 2)
+    tagList(tags$b("Automatic rule: "), "all numeric variables are treated as scale items.",
+            tags$br(), tags$b("Items: "), paste(n, collapse = ", "))
+  })
+  
+  output$mv_auto <- renderUI({
+    n <- head(types()$numeric, MAX_AUTO_MV_VARS)
+    req(length(n) >= 2)
+    tagList(tags$b("Automatic rule: "), sprintf("all numeric variables are used (first %d at most).", MAX_AUTO_MV_VARS),
+            tags$br(), tags$b("Variables: "), paste(n, collapse = ", "))
+  })
+  
+  output$out_auto <- renderUI({
+    n <- types()$numeric
+    req(length(n) >= 1)
+    tagList(tags$b("Automatic rule: "), "outliers are flagged in every numeric variable.",
+            tags$br(), tags$b("Variables: "), paste(n, collapse = ", "))
   })
   
   
   # ----------------------------------------------------------
-  # NORMALITY CHECK
+  # 1. NORMALITY CHECK
   # ----------------------------------------------------------
   
   norm_result <- eventReactive(input$norm_run, {
@@ -1018,7 +1212,7 @@ server <- function(input, output, session) {
   
   
   # ----------------------------------------------------------
-  # LINEAR REGRESSION
+  # 2. LINEAR REGRESSION (+ ridge)
   # ----------------------------------------------------------
   
   reg_model <- eventReactive(input$reg_run, {
@@ -1028,6 +1222,14 @@ server <- function(input, output, session) {
     fit_lm(data(),
            dv  = if (auto) num[1]  else input$reg_dv,
            ivs = if (auto) num[-1] else input$reg_iv)
+  })
+  
+  reg_vif <- reactive(calc_vif(reg_model()))
+  
+  # Ridge is only offered once VIF has actually flagged multicollinearity.
+  reg_show_ridge <- reactive({
+    v <- reg_vif()$VIF
+    length(v) > 0 && !all(is.na(v)) && max(v, na.rm = TRUE) >= VIF_FLAG_THRESHOLD
   })
   
   output$reg_results_ui <- renderUI({
@@ -1045,63 +1247,20 @@ server <- function(input, output, session) {
       panel_card("Multicollinearity Check", uiOutput("reg_collinearity")),
       panel_card("Regression Results", verbatimTextOutput("reg_summary")),
       panel_card("Regression Coefficients", tableOutput("reg_coefs")),
-      uiOutput("ridge_results_ui")
-    )
-  })
-  
-  output$reg_collinearity <- renderUI({
-    v <- calc_vif(reg_model())
-    show_ridge <- !all(is.na(v$VIF)) && max(v$VIF, na.rm = TRUE) >= 5
-    tagList(
-      vif_alert(v), tableOutput("reg_vif"),
-      if (show_ridge) tagList(
-        br(),
-        div(class = "hint-box",
-            "Multicollinearity is affecting the ordinary least squares estimates. ",
-            "Ridge regression shrinks the coefficients toward zero and can produce more ",
-            "stable estimates when predictors are highly correlated."),
-        actionButton("reg_ridge_run", "Run Ridge Regression", icon = icon("play"),
-                     class = "btn-primary")
+      if (reg_show_ridge()) panel_card(
+        "Ridge Regression (suggested due to multicollinearity)",
+        p("Ridge regression shrinks correlated predictors' coefficients toward zero, trading a small",
+          "amount of bias for lower variance and more stable estimates than ordinary least squares."),
+        tableOutput("reg_ridge"), uiOutput("reg_ridge_note")
       )
     )
   })
   
-  ridge_model <- eventReactive(input$reg_ridge_run, {
-    m <- req(reg_model())
-    md <- model.frame(m)
-    y <- md[[1]]
-    x <- as.matrix(md[-1])
-    validate(need(nrow(x) > ncol(x) + 1, "Not enough observations to fit a ridge regression."))
-    cv <- glmnet::cv.glmnet(x, y, alpha = 0, standardize = TRUE)
-    fit <- glmnet::glmnet(x, y, alpha = 0, standardize = TRUE, lambda = cv$lambda.min)
-    list(fit = fit, lambda = cv$lambda.min, ols = coef(m))
+  output$reg_collinearity <- renderUI({
+    tagList(vif_alert(reg_vif()), tableOutput("reg_vif"))
   })
   
-  output$ridge_results_ui <- renderUI({
-    req(ridge_model())
-    tagList(
-      panel_card("Ridge Regression Results",
-                 p(sprintf("Penalty strength (\u03bb) chosen by 10-fold cross-validation: %.5f",
-                          ridge_model()$lambda)),
-                 tableOutput("ridge_coefs"),
-                 div(class = "hint-box",
-                     "Ridge coefficients are shrunk to reduce the instability caused by ",
-                     "multicollinearity, and do not have standard errors or p-values in the ",
-                     "usual OLS sense. Compare their signs and relative magnitudes to the OLS ",
-                     "coefficients above rather than testing them individually."))
-    )
-  })
-  
-  output$ridge_coefs <- renderTable({
-    r <- ridge_model()
-    rc <- as.matrix(coef(r$fit))
-    data.frame(Variable = rownames(rc),
-               OLS_Coefficient   = round(as.numeric(r$ols[rownames(rc)]), 4),
-               Ridge_Coefficient = round(as.numeric(rc[, 1]), 4),
-               row.names = NULL)
-  }, digits = 4)
-  
-  output$reg_vif <- renderTable(calc_vif(reg_model()), digits = 3)
+  output$reg_vif <- renderTable(reg_vif(), digits = 3)
   
   output$reg_summary <- renderPrint(summary(reg_model()))
   
@@ -1111,9 +1270,28 @@ server <- function(input, output, session) {
     cbind(Variable = rownames(co), co, row.names = NULL)
   }, digits = 4)
   
+  reg_ridge <- reactive({
+    m <- reg_model()
+    validate(need(nrow(model.matrix(m)) >= 10,
+                  "At least 10 observations are recommended for ridge regression cross-validation."))
+    fit_ridge(m)
+  })
+  
+  output$reg_ridge <- renderTable({
+    r <- reg_ridge()
+    ols <- coef(reg_model())
+    nm <- rownames(r$coef)
+    data.frame(Variable = nm, OLS = round(ols[nm], 4), Ridge = round(r$coef[, 1], 4))
+  }, digits = 4)
+  
+  output$reg_ridge_note <- renderUI({
+    p(class = "text-muted",
+      sprintf("Optimal penalty (\u03bb, chosen via cross-validation): %.4f", reg_ridge()$lambda))
+  })
+  
   
   # ----------------------------------------------------------
-  # CORRELATION ANALYSIS (two variables or a full matrix)
+  # 3. CORRELATION ANALYSIS (two variables or a full matrix)
   # ----------------------------------------------------------
   
   cor_result <- eventReactive(input$cor_run, {
@@ -1220,221 +1398,539 @@ server <- function(input, output, session) {
   
   
   # ----------------------------------------------------------
-  # LOGISTIC REGRESSION
+  # 4. LOGISTIC REGRESSION
   # ----------------------------------------------------------
   
-  logit_model <- eventReactive(input$logit_run, {
-    bin <- types()$binary
-    num <- types()$numeric
-    validate(need(length(bin) >= 1, "At least one two-category variable is required."))
-    validate(need(length(num) >= 1, "At least one numeric variable is required."))
-    auto <- input$logit_mode == "automatic"
-    fit_logit(data(),
-              dv  = if (auto) bin[1] else input$logit_dv,
-              ivs = if (auto) num    else input$logit_iv)
+  log_model <- eventReactive(input$log_run, {
+    validate(need(length(binary_vars()) >= 1, "At least one binary variable is required as the outcome."))
+    auto <- input$log_mode == "automatic"
+    dv  <- if (auto) binary_vars()[1] else input$log_dv
+    ivs <- if (auto) setdiff(types()$numeric, dv) else input$log_iv
+    fit_logit(data(), dv, ivs)
   })
   
-  output$logit_results_ui <- renderUI({
-    r <- req(logit_model())
-    m <- r$model
-    mcfadden <- 1 - m$deviance / m$null.deviance
-    pred <- ifelse(predict(m, type = "response") >= 0.5, r$positive_level, r$reference_level)
-    acc <- mean(pred == as.character(r$data[[r$dv]]))
-    
+  output$log_results_ui <- renderUI({
+    m <- req(log_model())
+    nullmod <- glm(m$model[[1]] ~ 1, family = binomial())
+    mcfadden <- 1 - as.numeric(logLik(m)) / as.numeric(logLik(nullmod))
     tagList(
       div(class = "tiles",
           stat_tile("Observations", nobs(m)),
-          stat_tile("McFadden's R\u00b2", sprintf("%.3f", mcfadden)),
+          stat_tile("McFadden R\u00b2", sprintf("%.3f", mcfadden)),
           stat_tile("AIC", sprintf("%.1f", AIC(m))),
-          stat_tile("Accuracy (0.5 cutoff)", sprintf("%.1f%%", 100 * acc)),
-          stat_tile("Predicting", sprintf('"%s" vs "%s"', r$positive_level, r$reference_level))),
-      panel_card("Logistic Regression Results", verbatimTextOutput("logit_summary")),
-      panel_card("Coefficients & Odds Ratios", tableOutput("logit_coefs")),
-      panel_card("Confusion Matrix (0.5 cutoff)", tableOutput("logit_confusion"))
+          stat_tile("Null Deviance", sprintf("%.1f", m$null.deviance)),
+          stat_tile("Residual Deviance", sprintf("%.1f", m$deviance))),
+      panel_card("Multicollinearity Check", uiOutput("log_collinearity")),
+      panel_card("Regression Results", verbatimTextOutput("log_summary")),
+      panel_card("Coefficients & Odds Ratios", tableOutput("log_coefs")),
+      panel_card("Classification (0.5 cutoff)", tableOutput("log_confmat"), uiOutput("log_accuracy"))
     )
   })
   
-  output$logit_summary <- renderPrint(summary(logit_model()$model))
+  output$log_collinearity <- renderUI({
+    v <- calc_vif(log_model())
+    tagList(vif_alert(v), tableOutput("log_vif"))
+  })
+  output$log_vif <- renderTable(calc_vif(log_model()), digits = 3)
   
-  output$logit_coefs <- renderTable({
-    co <- as.data.frame(summary(logit_model()$model)$coefficients)
-    co$`Odds Ratio` <- exp(co$Estimate)
-    co[["Pr(>|z|)"]] <- format.pval(co[["Pr(>|z|)"]], digits = 3, eps = 1e-4)
-    cbind(Variable = rownames(co), co, row.names = NULL)
-  }, digits = 4)
+  output$log_summary <- renderPrint(summary(log_model()))
   
-  output$logit_confusion <- renderTable({
-    r <- logit_model()
-    lvls <- c(r$reference_level, r$positive_level)
-    pred <- ifelse(predict(r$model, type = "response") >= 0.5, r$positive_level, r$reference_level)
-    actual <- as.character(r$data[[r$dv]])
-    tab <- table(Actual = factor(actual, lvls), Predicted = factor(pred, lvls))
-    d <- as.data.frame.matrix(tab)
-    cbind(Actual = rownames(d), d, row.names = NULL)
+  output$log_coefs <- renderTable({
+    m <- log_model()
+    co <- as.data.frame(summary(m)$coefficients)
+    ci <- suppressWarnings(confint.default(m))
+    out <- data.frame(Variable = rownames(co), Estimate = round(co[["Estimate"]], 4),
+                      SE = round(co[["Std. Error"]], 4), Z = round(co[["z value"]], 3),
+                      P = format.pval(co[["Pr(>|z|)"]], digits = 3, eps = 1e-4),
+                      OR = round(exp(co[["Estimate"]]), 3),
+                      OR_CI = sprintf("[%.3f, %.3f]", exp(ci[, 1]), exp(ci[, 2])), row.names = NULL)
+    names(out) <- c("Variable", "Estimate", "Std. Error", "Z value", "p value", "Odds Ratio", "OR 95% CI")
+    out
+  })
+  
+  output$log_confmat <- renderTable({
+    m <- log_model()
+    y <- m$model[[1]]; lv <- levels(y)
+    pred <- factor(ifelse(fitted(m) > 0.5, lv[2], lv[1]), levels = lv)
+    as.data.frame.matrix(table(Actual = y, Predicted = pred))
+  }, rownames = TRUE)
+  
+  output$log_accuracy <- renderUI({
+    m <- log_model()
+    y <- m$model[[1]]; lv <- levels(y)
+    pred <- factor(ifelse(fitted(m) > 0.5, lv[2], lv[1]), levels = lv)
+    tab <- table(y, pred)
+    acc <- sum(diag(tab)) / sum(tab)
+    sens <- tab[2, 2] / sum(tab[2, ])
+    spec <- tab[1, 1] / sum(tab[1, ])
+    alert("info", "Classification performance:",
+          sprintf("Accuracy = %.1f%%, Sensitivity = %.1f%%, Specificity = %.1f%% (positive class: %s).",
+                  100 * acc, 100 * sens, 100 * spec, lv[2]))
   })
   
   
   # ----------------------------------------------------------
-  # TESTING (t-tests)
+  # 5. HYPOTHESIS TESTING (t-tests, chi-square)
   # ----------------------------------------------------------
   
-  output$test_vars_ui <- renderUI({
-    req(input$test_type)
-    num <- types()$numeric
-    bin <- types()$binary
-    switch(
-      input$test_type,
-      "One-Sample t-test" = tagList(
-        selectInput("test_var", "Numeric variable:", num),
-        numericInput("test_mu", "Test value (\u03bc\u2080):", value = 0)),
-      "Independent Samples t-test" = tagList(
-        selectInput("test_var", "Numeric variable:", num),
-        selectInput("test_group", "Grouping variable (2 categories):", bin)),
-      "Paired t-test" = tagList(
-        selectInput("test_var1", "Variable 1:", num),
-        selectInput("test_var2", "Variable 2:", num, selected = num[2]))
+  output$test_manual_ui <- renderUI({
+    n <- types()$numeric; k <- types()$categorical; type <- req(input$test_type)
+    need_v <- TESTS[[type]]
+    if (length(k) < need_v["cat"] || length(n) < need_v["num"]) {
+      return(alert("warning", "Not available:",
+                   sprintf("%s needs at least %d categorical and %d numeric variable(s).",
+                           type, need_v["cat"], need_v["num"])))
+    }
+    switch(type,
+      "One-Sample t-test"  = selectInput("test_x", "Numeric variable:", n),
+      "Independent t-test" = tagList(selectInput("test_x", "Numeric variable:", n),
+                                     selectInput("test_g", "Grouping variable (2 levels):", k)),
+      "Paired t-test"      = tagList(selectInput("test_x", "Variable 1:", n),
+                                     selectInput("test_y", "Variable 2:", n, selected = n[min(2, length(n))])),
+      "Chi-Square Test"    = tagList(selectInput("test_x", "Variable 1:", k),
+                                     selectInput("test_y", "Variable 2:", k, selected = k[min(2, length(k))]))
     )
   })
   
   test_result <- eventReactive(input$test_run, {
-    df <- data()
-    type <- input$test_type
+    df <- data(); n <- types()$numeric; k <- types()$categorical
+    type <- input$test_type; auto <- input$test_mode == "automatic"
+    need_v <- TESTS[[type]]
+    validate(need(length(k) >= need_v["cat"] && length(n) >= need_v["num"],
+                  "The dataset does not have the variables this test requires."))
+    pick <- function(auto_val, id) if (auto) auto_val else input[[id]]
     
-    if (type == "One-Sample t-test") {
-      validate(need(isTruthy(input$test_var), "Select a numeric variable."))
-      x <- as.numeric(df[[input$test_var]]); x <- x[is.finite(x)]
-      validate(need(length(x) >= 2, "At least 2 valid observations are required."))
-      tt <- t.test(x, mu = input$test_mu)
-      list(type = type, test = tt, label = input$test_var, mu = input$test_mu)
-      
-    } else if (type == "Independent Samples t-test") {
-      validate(need(isTruthy(input$test_var) && isTruthy(input$test_group),
-                    "Select a numeric variable and a two-category grouping variable."))
-      x <- as.numeric(df[[input$test_var]])
-      g <- df[[input$test_group]]
-      ok <- is.finite(x) & !is.na(g)
-      x <- x[ok]; g <- g[ok]
-      validate(need(length(unique(g)) == 2, "The grouping variable must have exactly two categories."))
-      validate(need(all(table(g) >= 2), "Each group needs at least 2 valid observations."))
-      tt <- t.test(x ~ g)
-      list(type = type, test = tt, label = input$test_var, group = input$test_group)
-      
-    } else {
-      validate(need(isTruthy(input$test_var1) && isTruthy(input$test_var2) &&
-                      !identical(input$test_var1, input$test_var2),
-                    "Select two different numeric variables."))
-      d <- df[complete.cases(df[c(input$test_var1, input$test_var2)]), ]
-      validate(need(nrow(d) >= 2, "At least 2 paired observations are required."))
-      tt <- t.test(d[[input$test_var1]], d[[input$test_var2]], paired = TRUE)
-      list(type = type, test = tt, label = paste(input$test_var1, "vs", input$test_var2))
-    }
+    res <- switch(type,
+      "One-Sample t-test" = {
+        x <- pick(n[1], "test_x")
+        v <- df[[x]]; v <- v[is.finite(v)]
+        validate(need(length(v) >= 2, "At least two valid observations are required."))
+        list(test = t.test(v, mu = input$test_mu),
+             label = sprintf("One-sample t-test: %s vs \u03bc = %s", x, input$test_mu))
+      },
+      "Independent t-test" = {
+        x <- pick(n[1], "test_x"); g <- pick(k[1], "test_g")
+        d <- grouped_xy(df, x, g)
+        lv <- levels(d[[g]])
+        validate(need(length(lv) == 2, "The grouping variable must have exactly two levels."))
+        list(test = t.test(d[[x]][d[[g]] == lv[1]], d[[x]][d[[g]] == lv[2]]),
+             label = sprintf("Independent t-test: %s by %s", x, g))
+      },
+      "Paired t-test" = {
+        x <- pick(n[1], "test_x"); y <- pick(n[min(2, length(n))], "test_y")
+        validate(need(!identical(x, y), "Select two different variables."))
+        d <- df[c(x, y)]; d <- d[complete.cases(d), ]
+        validate(need(nrow(d) >= 2, "At least two complete paired observations are required."))
+        list(test = t.test(d[[x]], d[[y]], paired = TRUE),
+             label = sprintf("Paired t-test: %s vs %s", x, y))
+      },
+      "Chi-Square Test" = {
+        x <- pick(k[1], "test_x"); y <- pick(k[min(2, length(k))], "test_y")
+        validate(need(!identical(x, y), "Select two different variables."))
+        tab <- table(df[[x]], df[[y]])
+        validate(need(all(dim(tab) >= 2), "Both variables must have at least two categories."))
+        list(test = suppressWarnings(chisq.test(tab)), label = sprintf("Chi-square test: %s vs %s", x, y))
+      }
+    )
+    res
   })
   
   output$test_results_ui <- renderUI({
-    req(test_result())
-    panel_card("Test Results", tableOutput("test_table"),
-               h5("Interpretation"), uiOutput("test_interp"))
+    r <- req(test_result())
+    panel_card(r$label, verbatimTextOutput("test_print"), h5("Interpretation"), uiOutput("test_interp"))
   })
-  
-  output$test_table <- renderTable({
-    tt <- test_result()$test
-    data.frame(
-      Statistic = c("t", "df", "p-value", "95% CI Lower", "95% CI Upper",
-                    if (length(tt$estimate) == 2) c("Mean (Group 1)", "Mean (Group 2)")
-                    else "Mean / Mean Difference"),
-      Value = c(sprintf("%.4f", tt$statistic), sprintf("%.2f", tt$parameter),
-                format.pval(tt$p.value, digits = 4),
-                sprintf("%.4f", tt$conf.int[1]), sprintf("%.4f", tt$conf.int[2]),
-                sprintf("%.4f", tt$estimate))
-    )
-  })
-  
+  output$test_print <- renderPrint(test_result()$test)
   output$test_interp <- renderUI({
-    r <- test_result()
-    tt <- r$test
-    sig <- tt$p.value < 0.05
-    p_txt <- format.pval(tt$p.value, digits = 4)
-    msg <- switch(
-      r$type,
-      "One-Sample t-test" = sprintf(
-        "The mean of %s is %sstatistically different from %.4g (p = %s).",
-        r$label, if (sig) "" else "not ", r$mu, p_txt),
-      "Independent Samples t-test" = sprintf(
-        "%s is %sstatistically different between the two levels of %s (p = %s).",
-        r$label, if (sig) "" else "not ", r$group, p_txt),
-      "Paired t-test" = sprintf(
-        "The mean difference between the paired measurements is %sstatistically significant (p = %s).",
-        if (sig) "" else "not ", p_txt)
-    )
-    alert(if (sig) "warning" else "success", "t-test result:", msg)
+    p <- test_result()$test$p.value
+    alert(if (p < 0.05) "warning" else "success", "Result:",
+          sprintf("p = %s. The difference is %sstatistically significant at the 0.05 level.",
+                  format.pval(p, digits = 4), if (p < 0.05) "" else "not "))
   })
   
   
   # ----------------------------------------------------------
-  # ANOVA (one-way)
+  # 6. ANOVA (one-way, with Levene's test and Tukey HSD)
   # ----------------------------------------------------------
   
-  anova_model <- eventReactive(input$anova_run, {
-    num <- types()$numeric
-    cat <- types()$categorical
-    validate(need(length(num) >= 1 && length(cat) >= 1,
-                  "At least one numeric variable and one categorical variable are required."))
+  anova_result <- eventReactive(input$anova_run, {
+    n <- types()$numeric; k <- types()$categorical
+    validate(need(length(n) >= 1 && length(k) >= 1,
+                  "At least one numeric and one categorical variable are required."))
     auto <- input$anova_mode == "automatic"
-    dv     <- if (auto) num[1] else input$anova_dv
-    factor_var <- if (auto) cat[1] else input$anova_factor
-    validate(need(isTruthy(dv) && isTruthy(factor_var),
-                  "Select a numeric variable and a categorical factor."))
-    validate(need(!identical(dv, factor_var),
-                  "The dependent variable and the factor must be different."))
-    
-    d <- data()[complete.cases(data()[c(dv, factor_var)]), c(dv, factor_var)]
-    d[[factor_var]] <- factor(d[[factor_var]])
-    validate(need(nlevels(d[[factor_var]]) >= 2, "The factor must have at least two levels."))
-    validate(need(all(table(d[[factor_var]]) >= 2), "Each group needs at least 2 observations."))
-    
-    f <- reformulate(factor_var, response = dv)
-    list(fit = aov(f, data = d), dv = dv, factor = factor_var, data = d)
+    y <- if (auto) n[1] else input$anova_y
+    g <- if (auto) k[1] else input$anova_g
+    d <- grouped_xy(data(), y, g)
+    validate(need(nlevels(d[[g]]) >= 2, "The grouping variable must have at least two levels with data."))
+    validate(need(nrow(d) > nlevels(d[[g]]), "Not enough observations relative to the number of groups."))
+    list(y = y, g = g, d = d, fit = aov(reformulate(g, y), data = d))
   })
   
   output$anova_results_ui <- renderUI({
-    req(anova_model())
+    r <- req(anova_result())
     tagList(
-      panel_card("ANOVA Table", tableOutput("anova_table"), uiOutput("anova_interp")),
+      panel_card(paste("ANOVA:", r$y, "by", r$g), tableOutput("anova_table"), uiOutput("anova_interp")),
+      panel_card("Homogeneity of Variance (Levene's Test)", uiOutput("anova_levene")),
       panel_card("Tukey HSD Post-Hoc Comparisons", tableOutput("anova_tukey")),
-      panel_card("Group Distributions", plotOutput("anova_plot", height = "420px"))
+      panel_card("Group Distribution", plotOutput("anova_plot", height = "420px"))
     )
   })
   
   output$anova_table <- renderTable({
-    s <- summary(anova_model()$fit)[[1]]
-    out <- data.frame(Source = trimws(rownames(s)), s, row.names = NULL)
-    names(out) <- c("Source", "Df", "Sum Sq", "Mean Sq", "F value", "Pr(>F)")
-    out$`Pr(>F)` <- format.pval(out$`Pr(>F)`, digits = 4, eps = 1e-4)
-    out
-  }, digits = 4, na = "")
+    s <- summary(anova_result()$fit)[[1]]
+    eta2 <- s[1, "Sum Sq"] / sum(s[["Sum Sq"]])
+    data.frame(Source = trimws(rownames(s)), Df = s[["Df"]],
+               `Sum Sq` = round(s[["Sum Sq"]], 3), `Mean Sq` = round(s[["Mean Sq"]], 3),
+               `F value` = c(round(s[["F value"]][1], 3), NA),
+               `p value` = c(format.pval(s[["Pr(>F)"]][1], digits = 4), NA),
+               `Eta Squared` = c(round(eta2, 3), NA), check.names = FALSE)
+  }, na = "")
   
   output$anova_interp <- renderUI({
-    r <- anova_model()
-    p <- summary(r$fit)[[1]][["Pr(>F)"]][1]
-    if (is.na(p)) return(NULL)
-    sig <- p < 0.05
-    alert(if (sig) "warning" else "success", "Interpretation:",
-          sprintf("The mean of %s %s significantly across the levels of %s (p = %s).",
-                  r$dv, if (sig) "differs" else "does not differ significantly",
-                  r$factor, format.pval(p, digits = 4)))
+    p <- summary(anova_result()$fit)[[1]][["Pr(>F)"]][1]
+    alert(if (p < 0.05) "warning" else "success", "Result:",
+          sprintf("p = %s. Group means are %sstatistically significantly different at the 0.05 level.",
+                  format.pval(p, digits = 4), if (p < 0.05) "" else "not "))
+  })
+  
+  output$anova_levene <- renderUI({
+    r <- anova_result(); d <- r$d
+    dev <- abs(d[[r$y]] - ave(d[[r$y]], d[[r$g]], FUN = median))
+    p <- summary(aov(dev ~ d[[r$g]]))[[1]][["Pr(>F)"]][1]
+    alert(if (p < 0.05) "warning" else "success", "Levene's test (Brown-Forsythe):",
+          sprintf("p = %s. Variances are %shomogeneous across groups at the 0.05 level.",
+                  format.pval(p, digits = 4), if (p < 0.05) "not " else ""))
   })
   
   output$anova_tukey <- renderTable({
-    tk <- TukeyHSD(anova_model()$fit)[[1]]
-    out <- data.frame(Comparison = rownames(tk), tk, row.names = NULL)
-    names(out) <- c("Comparison", "Difference", "Lower CI", "Upper CI", "p adj")
-    out$`p adj` <- format.pval(out$`p adj`, digits = 4, eps = 1e-4)
-    out
-  }, digits = 4)
+    r <- anova_result()
+    validate(need(nlevels(r$d[[r$g]]) >= 2, "Not enough groups for post-hoc comparisons."))
+    tk <- as.data.frame(TukeyHSD(r$fit)[[1]])
+    data.frame(Comparison = rownames(tk), Diff = round(tk$diff, 3),
+               Lower = round(tk$lwr, 3), Upper = round(tk$upr, 3),
+               `p adj` = format.pval(tk$`p adj`, digits = 4), check.names = FALSE)
+  })
   
   output$anova_plot <- renderPlot({
-    r <- anova_model()
-    plot_chart("Boxplot", r$data, x = r$dv, group = r$factor)
+    r <- anova_result()
+    plot_chart("Boxplot", r$d, x = r$y, group = r$g)
+  })
+  
+  
+  # ----------------------------------------------------------
+  # 7. NON-PARAMETRIC TESTS
+  # ----------------------------------------------------------
+  
+  output$np_manual_ui <- renderUI({
+    n <- types()$numeric; k <- types()$categorical; type <- req(input$np_type)
+    need_v <- NP_TESTS[[type]]
+    if (length(k) < need_v["cat"] || length(n) < need_v["num"]) {
+      return(alert("warning", "Not available:",
+                   sprintf("%s needs at least %d categorical and %d numeric variable(s).",
+                           type, need_v["cat"], need_v["num"])))
+    }
+    if (type == "Wilcoxon Signed-Rank (paired)") {
+      tagList(selectInput("np_x", "Variable 1:", n),
+              selectInput("np_y", "Variable 2:", n, selected = n[min(2, length(n))]))
+    } else {
+      tagList(selectInput("np_x", "Numeric variable:", n),
+              selectInput("np_g", "Grouping variable:", k))
+    }
+  })
+  
+  np_result <- eventReactive(input$np_run, {
+    df <- data(); n <- types()$numeric; k <- types()$categorical
+    type <- input$np_type; auto <- input$np_mode == "automatic"
+    need_v <- NP_TESTS[[type]]
+    validate(need(length(k) >= need_v["cat"] && length(n) >= need_v["num"],
+                  "The dataset does not have the variables this test requires."))
+    pick <- function(auto_val, id) if (auto) auto_val else input[[id]]
+    
+    if (type == "Wilcoxon Signed-Rank (paired)") {
+      x <- pick(n[1], "np_x"); y <- pick(n[min(2, length(n))], "np_y")
+      validate(need(!identical(x, y), "Select two different variables."))
+      d <- df[c(x, y)]; d <- d[complete.cases(d), ]
+      validate(need(nrow(d) >= 2, "At least two complete paired observations are required."))
+      return(list(test = suppressWarnings(wilcox.test(d[[x]], d[[y]], paired = TRUE)),
+                  label = sprintf("Wilcoxon signed-rank test: %s vs %s", x, y), effect = NULL, post = NULL))
+    }
+    
+    x <- pick(n[1], "np_x"); g <- pick(k[1], "np_g")
+    d <- grouped_xy(df, x, g)
+    lv <- levels(d[[g]])
+    validate(need(length(lv) >= 2, "The grouping variable must have at least two levels with data."))
+    
+    if (type == "Mann-Whitney U (2 groups)") {
+      validate(need(length(lv) == 2, "This test requires exactly two groups. Use Kruskal-Wallis for 3+ groups."))
+      a <- d[[x]][d[[g]] == lv[1]]; b <- d[[x]][d[[g]] == lv[2]]
+      wt <- suppressWarnings(wilcox.test(a, b))
+      list(test = wt, label = sprintf("Mann-Whitney U test: %s by %s", x, g),
+           effect = sprintf("Rank-biserial correlation r = %.3f",
+                            1 - (2 * unname(wt$statistic)) / (length(a) * length(b))),
+           post = NULL)
+    } else {
+      kt <- kruskal.test(d[[x]], d[[g]])
+      eps2 <- unname(kt$statistic) / (nrow(d) - 1)
+      post <- pairwise.wilcox.test(d[[x]], d[[g]], p.adjust.method = "bonferroni")
+      list(test = kt, label = sprintf("Kruskal-Wallis test: %s by %s", x, g),
+           effect = sprintf("Epsilon squared = %.3f", eps2), post = post)
+    }
+  })
+  
+  output$np_results_ui <- renderUI({
+    r <- req(np_result())
+    tagList(
+      panel_card(r$label, verbatimTextOutput("np_print"),
+                 if (!is.null(r$effect)) p(tags$b("Effect size: "), r$effect),
+                 h5("Interpretation"), uiOutput("np_interp")),
+      if (!is.null(r$post)) panel_card("Pairwise Comparisons (Bonferroni-adjusted)", tableOutput("np_post"))
+    )
+  })
+  output$np_print <- renderPrint(np_result()$test)
+  output$np_interp <- renderUI({
+    p <- np_result()$test$p.value
+    alert(if (p < 0.05) "warning" else "success", "Result:",
+          sprintf("p = %s. The difference is %sstatistically significant at the 0.05 level.",
+                  format.pval(p, digits = 4), if (p < 0.05) "" else "not "))
+  })
+  output$np_post <- renderTable({
+    pm <- np_result()$post$p.value
+    d <- as.data.frame(as.table(pm))
+    names(d) <- c("Group 1", "Group 2", "p_value")
+    d <- d[!is.na(d$p_value), ]
+    d$p_value <- format.pval(d$p_value, digits = 4)
+    d
+  })
+  
+  
+  # ----------------------------------------------------------
+  # 8. TIME SERIES ANALYSIS
+  # ----------------------------------------------------------
+  
+  ts_result <- eventReactive(input$ts_run, {
+    df <- data(); n <- types()$numeric
+    validate(need(length(n) >= 1, "At least one numeric variable is required."))
+    auto <- input$ts_mode == "automatic"
+    v <- if (auto) n[1] else input$ts_var
+    tvar <- if (auto) "" else input$ts_time
+    freq <- if (auto) 1 else input$ts_freq
+    x <- df[[v]]
+    ord <- if (nzchar(tvar) && tvar %in% names(df)) order(df[[tvar]]) else seq_along(x)
+    x <- x[ord]; x <- x[is.finite(x)]
+    validate(need(length(x) >= 4, "At least 4 valid, ordered observations are required."))
+    
+    lb <- Box.test(x, lag = max(1, min(10, floor(length(x) / 5))), type = "Ljung-Box")
+    decomp <- if (freq > 1 && length(x) >= 2 * freq) {
+      tryCatch(decompose(ts(x, frequency = freq)), error = function(e) NULL)
+    }
+    list(var = v, time = tvar, freq = freq, x = x, n = length(x), lb = lb, decomp = decomp)
+  })
+  
+  output$ts_results_ui <- renderUI({
+    r <- req(ts_result())
+    tagList(
+      panel_card(paste("Time Series:", r$var), plotOutput("ts_line", height = "350px")),
+      panel_card("Autocorrelation (ACF / PACF)",
+                 fluidRow(column(6, plotOutput("ts_acf", height = "320px")),
+                         column(6, plotOutput("ts_pacf", height = "320px"))),
+                 uiOutput("ts_lb")),
+      if (!is.null(r$decomp)) panel_card("Seasonal Decomposition", plotOutput("ts_decomp", height = "480px"))
+      else panel_card("Seasonal Decomposition",
+                      alert("info", "Not available:",
+                            "set a seasonal frequency greater than 1 (with enough observations) to decompose the series."))
+    )
+  })
+  
+  output$ts_line <- renderPlot({
+    r <- ts_result()
+    d <- data.frame(t = seq_along(r$x), v = r$x)
+    ggplot(d, aes(t, v)) + geom_line(colour = ACCENT, linewidth = 1) + geom_point(colour = ACCENT, alpha = 0.6) +
+      labs(title = paste(r$var, "over time"), x = if (nzchar(r$time)) r$time else "Observation order", y = r$var) +
+      theme_app
+  })
+  
+  output$ts_acf <- renderPlot({
+    r <- ts_result(); a <- acf(r$x, plot = FALSE)
+    d <- data.frame(lag = as.numeric(a$lag)[-1], acf = as.numeric(a$acf)[-1])
+    ci <- qnorm(0.975) / sqrt(r$n)
+    ggplot(d, aes(lag, acf)) + geom_col(fill = ACCENT, width = 0.4) +
+      geom_hline(yintercept = c(-ci, ci), linetype = "dashed", colour = "#C8553D") +
+      labs(title = "ACF", x = "Lag", y = "Autocorrelation") + theme_app
+  })
+  
+  output$ts_pacf <- renderPlot({
+    r <- ts_result(); a <- pacf(r$x, plot = FALSE)
+    d <- data.frame(lag = as.numeric(a$lag), pacf = as.numeric(a$acf))
+    ci <- qnorm(0.975) / sqrt(r$n)
+    ggplot(d, aes(lag, pacf)) + geom_col(fill = ACCENT, width = 0.4) +
+      geom_hline(yintercept = c(-ci, ci), linetype = "dashed", colour = "#C8553D") +
+      labs(title = "PACF", x = "Lag", y = "Partial autocorrelation") + theme_app
+  })
+  
+  output$ts_lb <- renderUI({
+    lb <- ts_result()$lb
+    alert("info", "Ljung-Box test for autocorrelation:",
+          sprintf("p = %s. %s", format.pval(lb$p.value, digits = 4),
+                  if (lb$p.value < 0.05) "Significant autocorrelation is present in the series."
+                  else "No significant autocorrelation was detected."))
+  })
+  
+  output$ts_decomp <- renderPlot({
+    dc <- ts_result()$decomp; req(dc)
+    plot(dc)
+  })
+  
+  
+  # ----------------------------------------------------------
+  # 9. RELIABILITY ANALYSIS (Cronbach's alpha)
+  # ----------------------------------------------------------
+  
+  rel_result <- eventReactive(input$rel_run, {
+    n <- types()$numeric
+    validate(need(length(n) >= 2, "At least two numeric variables are required."))
+    auto <- input$rel_mode == "automatic"
+    items <- if (auto) n else input$rel_items
+    validate(need(length(items) >= 2, "Select at least two scale items."))
+    d <- data()[items]; d <- d[complete.cases(d), ]
+    validate(need(nrow(d) >= 3, "At least 3 complete observations are required."))
+    flat <- items[vapply(d, function(x) length(unique(x)) <= 1, logical(1))]
+    validate(need(!length(flat), paste("Insufficient variation in:", paste(flat, collapse = ", "))))
+    cronbach_alpha(d)
+  })
+  
+  output$rel_results_ui <- renderUI({
+    r <- req(rel_result())
+    tagList(
+      div(class = "tiles",
+          stat_tile("Cronbach's Alpha", sprintf("%.3f", r$alpha)),
+          stat_tile("Items", r$k), stat_tile("N (complete cases)", r$n)),
+      panel_card("Interpretation", uiOutput("rel_interp")),
+      panel_card("Item Statistics", tableOutput("rel_items_table"))
+    )
+  })
+  
+  output$rel_interp <- renderUI({
+    a <- rel_result()$alpha
+    lvl <- if (a >= .9) "excellent" else if (a >= .8) "good" else if (a >= .7) "acceptable" else
+      if (a >= .6) "questionable" else if (a >= .5) "poor" else "unacceptable"
+    alert(if (a >= .7) "success" else "warning", "Internal consistency:",
+          sprintf("Cronbach's alpha = %.3f, which is generally considered %s.", a, lvl))
+  })
+  
+  output$rel_items_table <- renderTable(rel_result()$items, digits = 3)
+  
+  
+  # ----------------------------------------------------------
+  # 10. MULTIVARIATE ANALYSIS (PCA + hierarchical clustering)
+  # ----------------------------------------------------------
+  
+  mv_result <- eventReactive(input$mv_run, {
+    n <- types()$numeric
+    validate(need(length(n) >= 2, "At least two numeric variables are required."))
+    auto <- input$mv_mode == "automatic"
+    vars <- if (auto) head(n, MAX_AUTO_MV_VARS) else input$mv_vars
+    validate(need(length(vars) >= 2, "Select at least two numeric variables."))
+    d <- data()[vars]; d <- d[complete.cases(d), ]
+    validate(need(nrow(d) >= length(vars) + 1,
+                  "Not enough complete observations relative to the number of variables."))
+    validate(need(nrow(d) >= 3, "At least three observations are required for clustering."))
+    flat <- vars[vapply(d, function(x) length(unique(x)) <= 1, logical(1))]
+    validate(need(!length(flat), paste("Insufficient variation in:", paste(flat, collapse = ", "))))
+    
+    pca <- prcomp(d, scale. = input$mv_scale)
+    hc <- hclust(dist(scale(d)))
+    k <- max(2, min(input$mv_k, nrow(d) - 1))
+    list(vars = vars, d = d, pca = pca, hc = hc, k = k, clusters = cutree(hc, k))
+  })
+  
+  output$mv_results_ui <- renderUI({
+    req(mv_result())
+    tagList(
+      panel_card("Variance Explained", tableOutput("mv_var_table"), plotOutput("mv_scree", height = "320px")),
+      panel_card("Component Loadings", tableOutput("mv_loadings")),
+      panel_card("PCA Biplot (PC1 vs PC2, coloured by cluster)", plotOutput("mv_biplot", height = "480px")),
+      panel_card("Hierarchical Clustering", plotOutput("mv_dendro", height = "400px"),
+                 tableOutput("mv_cluster_sizes"))
+    )
+  })
+  
+  output$mv_var_table <- renderTable({
+    s <- summary(mv_result()$pca)$importance
+    data.frame(Component = colnames(s), t(round(s, 3)), row.names = NULL, check.names = FALSE)
+  })
+  
+  output$mv_scree <- renderPlot({
+    s <- summary(mv_result()$pca)$importance
+    d <- data.frame(PC = factor(colnames(s), levels = colnames(s)),
+                    Variance = s["Proportion of Variance", ], Cumulative = s["Cumulative Proportion", ])
+    ggplot(d, aes(PC, Variance, group = 1)) +
+      geom_col(fill = ACCENT) + geom_line(aes(y = Cumulative), colour = "#C8553D", linewidth = 1) +
+      geom_point(aes(y = Cumulative), colour = "#C8553D") +
+      labs(title = "Scree plot", y = "Proportion of variance", x = NULL) + theme_app
+  })
+  
+  output$mv_loadings <- renderTable({
+    l <- mv_result()$pca$rotation
+    data.frame(Variable = rownames(l), round(l, 3), row.names = NULL)
+  }, digits = 3)
+  
+  output$mv_biplot <- renderPlot({
+    r <- mv_result()
+    sc <- as.data.frame(r$pca$x[, 1:2, drop = FALSE])
+    sc$Cluster <- factor(r$clusters)
+    ld <- as.data.frame(r$pca$rotation[, 1:2, drop = FALSE])
+    ld$Variable <- rownames(ld)
+    mul <- 0.8 * max(abs(sc[c("PC1", "PC2")])) / max(abs(ld[c("PC1", "PC2")]))
+    ggplot() +
+      geom_point(data = sc, aes(PC1, PC2, colour = Cluster), alpha = 0.7) +
+      geom_segment(data = ld, aes(x = 0, y = 0, xend = PC1 * mul, yend = PC2 * mul),
+                  arrow = arrow(length = grid::unit(0.2, "cm")), colour = "#33414f") +
+      geom_text(data = ld, aes(PC1 * mul * 1.1, PC2 * mul * 1.1, label = Variable),
+               size = 3.3, colour = "#33414f") +
+      scale_colour_viridis_d(end = 0.85) +
+      labs(title = "PCA biplot") + theme_app
+  })
+  
+  output$mv_dendro <- renderPlot({
+    r <- mv_result()
+    plot(r$hc, main = "Hierarchical clustering dendrogram", xlab = "", sub = "")
+    rect.hclust(r$hc, k = r$k, border = ACCENT)
+  })
+  
+  output$mv_cluster_sizes <- renderTable({
+    cl <- mv_result()$clusters
+    data.frame(Cluster = names(table(cl)), Size = as.integer(table(cl)))
+  })
+  
+  
+  # ----------------------------------------------------------
+  # 11. OUTLIER DETECTION
+  # ----------------------------------------------------------
+  
+  out_result <- eventReactive(input$out_run, {
+    n <- types()$numeric
+    validate(need(length(n) >= 1, "At least one numeric variable is required."))
+    auto <- input$out_mode == "automatic"
+    vars <- if (auto) n else input$out_vars
+    validate(need(length(vars) >= 1, "Select at least one numeric variable."))
+    list(vars = vars, method = input$out_method, summary = outlier_summary(data(), vars, input$out_method))
+  })
+  
+  output$out_results_ui <- renderUI({
+    r <- req(out_result())
+    tagList(
+      panel_card(paste0("Outlier Summary (", r$method, " method)"), tableOutput("out_table")),
+      panel_card("Visual Inspection",
+                 selectInput("out_plot_var", "Variable:", r$vars),
+                 plotOutput("out_plot", height = "400px"))
+    )
+  })
+  
+  output$out_table <- renderTable(out_result()$summary, digits = 2)
+  
+  output$out_plot <- renderPlot({
+    v <- req(input$out_plot_var)
+    validate(need(v %in% out_result()$vars, "Generate the summary again for this variable."))
+    plot_chart("Boxplot", data(), x = v)
   })
 }
 
