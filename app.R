@@ -17,6 +17,7 @@ library(shiny)
 library(readxl)
 library(haven)
 library(ggplot2)
+library(glmnet)   # ridge regression
 
 
 # ============================================================
@@ -137,7 +138,7 @@ theme_app <- theme_minimal(base_size = 13) + theme(plot.title = element_text(fac
 plot_chart <- function(type, df, x, y = NULL, group = NULL, stat = "Mean", bins = 30,
                        measures = NULL) {
   if (is.null(bins) || is.na(bins)) bins <- 30
-  
+
   p <- switch(type,
               "Histogram" = ggplot(df, aes(.data[[x]])) +
                 geom_histogram(bins = bins, fill = ACCENT, colour = "white", na.rm = TRUE) +
@@ -222,7 +223,7 @@ plot_chart <- function(type, df, x, y = NULL, group = NULL, stat = "Mean", bins 
               
               stop("Unknown chart type: ", type)
   )
-  
+
   p <- p + theme_app
   if (type == "Pie Chart") {
     p <- p + theme(axis.text = element_blank(), axis.ticks = element_blank(),
@@ -254,6 +255,33 @@ fit_lm <- function(df, dv, ivs) {
                 paste("Perfect multicollinearity detected among the independent variables.",
                       "The model cannot be estimated reliably.")))
   lm(f, data = md)
+}
+
+fit_logit <- function(df, dv, ivs) {
+  validate(
+    need(length(dv) == 1 && length(ivs) >= 1,
+         "Select one binary dependent variable and at least one independent variable."),
+    need(!(dv %in% ivs), "The dependent variable cannot also be an independent variable.")
+  )
+  vars <- c(dv, ivs)
+  md <- df[complete.cases(df[vars]), vars, drop = FALSE]
+  
+  validate(need(nrow(md) > length(ivs) + 1,
+                "Not enough complete observations relative to the number of model parameters."))
+  
+  lvl <- sort(unique(as.character(md[[dv]])))
+  validate(need(length(lvl) == 2,
+                paste("The dependent variable must have exactly two categories. Found:",
+                      paste(lvl, collapse = ", "))))
+  md[[dv]] <- factor(as.character(md[[dv]]), levels = lvl)
+  
+  flat <- ivs[vapply(md[ivs], function(x) length(unique(x)) <= 1, logical(1))]
+  validate(need(!length(flat),
+                paste("Insufficient variation in:", paste(flat, collapse = ", "))))
+  
+  f <- reformulate(ivs, response = dv)
+  m <- glm(f, data = md, family = binomial())
+  list(model = m, positive_level = lvl[2], reference_level = lvl[1], data = md, dv = dv)
 }
 
 calc_vif <- function(model) {
@@ -447,6 +475,44 @@ ui <- fluidPage(
                          run_button("cor_run", "Run Correlation Analysis"),
                          uiOutput("cor_msg")),
               uiOutput("cor_results_ui")
+            ),
+            
+            # ---- Logistic Regression ----
+            tabPanel(
+              "Logistic Regression", br(),
+              panel_card("Logistic Regression Setup",
+                         var_panel("logit", tagList(
+                           selectInput("logit_dv", "Dependent variable (2 categories):", choices = NULL),
+                           selectizeInput("logit_iv", "Independent variable(s):", choices = NULL,
+                                          multiple = TRUE,
+                                          options = list(plugins = list("remove_button"))))),
+                         run_button("logit_run", "Run Logistic Regression"),
+                         uiOutput("logit_msg")),
+              uiOutput("logit_results_ui")
+            ),
+            
+            # ---- Testing (t-tests) ----
+            tabPanel(
+              "Testing", br(),
+              panel_card("Test Setup",
+                         selectInput("test_type", "Test type:",
+                                     c("One-Sample t-test", "Independent Samples t-test", "Paired t-test")),
+                         uiOutput("test_vars_ui"),
+                         run_button("test_run", "Run Test"),
+                         uiOutput("test_msg")),
+              uiOutput("test_results_ui")
+            ),
+            
+            # ---- ANOVA ----
+            tabPanel(
+              "ANOVA", br(),
+              panel_card("One-Way ANOVA Setup",
+                         var_panel("anova", tagList(
+                           selectInput("anova_dv", "Numeric (dependent) variable:", choices = NULL),
+                           selectInput("anova_factor", "Categorical factor:", choices = NULL))),
+                         run_button("anova_run", "Run ANOVA"),
+                         uiOutput("anova_msg")),
+              uiOutput("anova_results_ui")
             )
           )
         )
@@ -497,7 +563,9 @@ server <- function(input, output, session) {
     numeric     <- flag(is.numeric)
     categorical <- flag(function(x) is.character(x) || is.factor(x) || is.logical(x))
     date        <- flag(function(x) inherits(x, c("Date", "POSIXct", "POSIXlt")))
-    list(numeric = numeric, categorical = categorical, date = date,
+    binary      <- categorical[vapply(df[categorical], function(x)
+                    length(unique(x[!is.na(x)])) == 2, logical(1))]
+    list(numeric = numeric, categorical = categorical, date = date, binary = binary,
          other = setdiff(nm, c(numeric, categorical, date)))
   })
   
@@ -756,6 +824,17 @@ server <- function(input, output, session) {
     updateSelectInput(session, "norm_var", choices = num)
     updateSelectInput(session, "reg_dv", choices = num)
     updateSelectInput(session, "cor_vars", choices = num)
+    updateSelectInput(session, "anova_dv", choices = num)
+  })
+  
+  observe({
+    updateSelectInput(session, "logit_dv", choices = types()$binary)
+    updateSelectizeInput(session, "logit_iv", choices = types()$numeric,
+                         selected = intersect(isolate(input$logit_iv), types()$numeric))
+  })
+  
+  observe({
+    updateSelectInput(session, "anova_factor", choices = types()$categorical)
   })
   
   # Regression predictors exclude the chosen dependent variable
@@ -780,6 +859,32 @@ server <- function(input, output, session) {
   output$reg_msg  <- renderUI(min_vars_msg(2, "Linear Regression"))
   output$cor_msg  <- renderUI(min_vars_msg(2, "Correlation Analysis"))
   
+  output$logit_msg <- renderUI({
+    if (length(types()$binary) < 1 || length(types()$numeric) < 1) {
+      alert("danger", "Logistic Regression unavailable:",
+            "the dataset must contain at least one two-category variable and one numeric variable.")
+    }
+  })
+  
+  output$test_msg <- renderUI({
+    if (length(types()$numeric) < 1) {
+      alert("danger", "Testing unavailable:", "the dataset must contain at least one numeric variable.")
+    } else if (input$test_type == "Independent Samples t-test" && length(types()$binary) < 1) {
+      alert("danger", "Independent Samples t-test unavailable:",
+            "the dataset must contain a two-category grouping variable.")
+    } else if (input$test_type == "Paired t-test" && length(types()$numeric) < 2) {
+      alert("danger", "Paired t-test unavailable:",
+            "the dataset must contain at least two numeric variables.")
+    }
+  })
+  
+  output$anova_msg <- renderUI({
+    if (length(types()$numeric) < 1 || length(types()$categorical) < 1) {
+      alert("danger", "ANOVA unavailable:",
+            "the dataset must contain at least one numeric variable and one categorical variable.")
+    }
+  })
+  
   # Description of the automatic selection rule for each tool
   output$norm_auto <- renderUI({
     v <- types()$numeric
@@ -803,6 +908,26 @@ server <- function(input, output, session) {
     tagList(tags$b("Automatic rule: "),
             sprintf("all numeric variables are correlated (first %d at most).", MAX_AUTO_CORR_VARS),
             tags$br(), tags$b("Selected variables: "), paste(v, collapse = ", "))
+  })
+  
+  output$logit_auto <- renderUI({
+    bin <- types()$binary
+    num <- types()$numeric
+    req(length(bin) >= 1, length(num) >= 1)
+    tagList(tags$b("Automatic rule: "),
+            "the first two-category variable is the outcome; all numeric variables are predictors.",
+            tags$br(), tags$b("Dependent variable: "), bin[1],
+            tags$br(), tags$b("Independent variable(s): "), paste(num, collapse = ", "))
+  })
+  
+  output$anova_auto <- renderUI({
+    num <- types()$numeric
+    cat <- types()$categorical
+    req(length(num) >= 1, length(cat) >= 1)
+    tagList(tags$b("Automatic rule: "),
+            "the first numeric variable is compared across the levels of the first categorical variable.",
+            tags$br(), tags$b("Dependent variable: "), num[1],
+            tags$br(), tags$b("Factor: "), cat[1])
   })
   
   
@@ -919,14 +1044,62 @@ server <- function(input, output, session) {
                     format.pval(pf(f[1], f[2], f[3], lower.tail = FALSE), digits = 3))),
       panel_card("Multicollinearity Check", uiOutput("reg_collinearity")),
       panel_card("Regression Results", verbatimTextOutput("reg_summary")),
-      panel_card("Regression Coefficients", tableOutput("reg_coefs"))
+      panel_card("Regression Coefficients", tableOutput("reg_coefs")),
+      uiOutput("ridge_results_ui")
     )
   })
   
   output$reg_collinearity <- renderUI({
     v <- calc_vif(reg_model())
-    tagList(vif_alert(v), tableOutput("reg_vif"))
+    show_ridge <- !all(is.na(v$VIF)) && max(v$VIF, na.rm = TRUE) >= 5
+    tagList(
+      vif_alert(v), tableOutput("reg_vif"),
+      if (show_ridge) tagList(
+        br(),
+        div(class = "hint-box",
+            "Multicollinearity is affecting the ordinary least squares estimates. ",
+            "Ridge regression shrinks the coefficients toward zero and can produce more ",
+            "stable estimates when predictors are highly correlated."),
+        actionButton("reg_ridge_run", "Run Ridge Regression", icon = icon("play"),
+                     class = "btn-primary")
+      )
+    )
   })
+  
+  ridge_model <- eventReactive(input$reg_ridge_run, {
+    m <- req(reg_model())
+    md <- model.frame(m)
+    y <- md[[1]]
+    x <- as.matrix(md[-1])
+    validate(need(nrow(x) > ncol(x) + 1, "Not enough observations to fit a ridge regression."))
+    cv <- glmnet::cv.glmnet(x, y, alpha = 0, standardize = TRUE)
+    fit <- glmnet::glmnet(x, y, alpha = 0, standardize = TRUE, lambda = cv$lambda.min)
+    list(fit = fit, lambda = cv$lambda.min, ols = coef(m))
+  })
+  
+  output$ridge_results_ui <- renderUI({
+    req(ridge_model())
+    tagList(
+      panel_card("Ridge Regression Results",
+                 p(sprintf("Penalty strength (\u03bb) chosen by 10-fold cross-validation: %.5f",
+                          ridge_model()$lambda)),
+                 tableOutput("ridge_coefs"),
+                 div(class = "hint-box",
+                     "Ridge coefficients are shrunk to reduce the instability caused by ",
+                     "multicollinearity, and do not have standard errors or p-values in the ",
+                     "usual OLS sense. Compare their signs and relative magnitudes to the OLS ",
+                     "coefficients above rather than testing them individually."))
+    )
+  })
+  
+  output$ridge_coefs <- renderTable({
+    r <- ridge_model()
+    rc <- as.matrix(coef(r$fit))
+    data.frame(Variable = rownames(rc),
+               OLS_Coefficient   = round(as.numeric(r$ols[rownames(rc)]), 4),
+               Ridge_Coefficient = round(as.numeric(rc[, 1]), 4),
+               row.names = NULL)
+  }, digits = 4)
   
   output$reg_vif <- renderTable(calc_vif(reg_model()), digits = 3)
   
@@ -1043,6 +1216,225 @@ server <- function(input, output, session) {
     }
     alert("info", "Interpretation:",
           tagList(msg, tags$br(), "Correlation does not by itself establish causation."))
+  })
+  
+  
+  # ----------------------------------------------------------
+  # LOGISTIC REGRESSION
+  # ----------------------------------------------------------
+  
+  logit_model <- eventReactive(input$logit_run, {
+    bin <- types()$binary
+    num <- types()$numeric
+    validate(need(length(bin) >= 1, "At least one two-category variable is required."))
+    validate(need(length(num) >= 1, "At least one numeric variable is required."))
+    auto <- input$logit_mode == "automatic"
+    fit_logit(data(),
+              dv  = if (auto) bin[1] else input$logit_dv,
+              ivs = if (auto) num    else input$logit_iv)
+  })
+  
+  output$logit_results_ui <- renderUI({
+    r <- req(logit_model())
+    m <- r$model
+    mcfadden <- 1 - m$deviance / m$null.deviance
+    pred <- ifelse(predict(m, type = "response") >= 0.5, r$positive_level, r$reference_level)
+    acc <- mean(pred == as.character(r$data[[r$dv]]))
+    
+    tagList(
+      div(class = "tiles",
+          stat_tile("Observations", nobs(m)),
+          stat_tile("McFadden's R\u00b2", sprintf("%.3f", mcfadden)),
+          stat_tile("AIC", sprintf("%.1f", AIC(m))),
+          stat_tile("Accuracy (0.5 cutoff)", sprintf("%.1f%%", 100 * acc)),
+          stat_tile("Predicting", sprintf('"%s" vs "%s"', r$positive_level, r$reference_level))),
+      panel_card("Logistic Regression Results", verbatimTextOutput("logit_summary")),
+      panel_card("Coefficients & Odds Ratios", tableOutput("logit_coefs")),
+      panel_card("Confusion Matrix (0.5 cutoff)", tableOutput("logit_confusion"))
+    )
+  })
+  
+  output$logit_summary <- renderPrint(summary(logit_model()$model))
+  
+  output$logit_coefs <- renderTable({
+    co <- as.data.frame(summary(logit_model()$model)$coefficients)
+    co$`Odds Ratio` <- exp(co$Estimate)
+    co[["Pr(>|z|)"]] <- format.pval(co[["Pr(>|z|)"]], digits = 3, eps = 1e-4)
+    cbind(Variable = rownames(co), co, row.names = NULL)
+  }, digits = 4)
+  
+  output$logit_confusion <- renderTable({
+    r <- logit_model()
+    lvls <- c(r$reference_level, r$positive_level)
+    pred <- ifelse(predict(r$model, type = "response") >= 0.5, r$positive_level, r$reference_level)
+    actual <- as.character(r$data[[r$dv]])
+    tab <- table(Actual = factor(actual, lvls), Predicted = factor(pred, lvls))
+    d <- as.data.frame.matrix(tab)
+    cbind(Actual = rownames(d), d, row.names = NULL)
+  })
+  
+  
+  # ----------------------------------------------------------
+  # TESTING (t-tests)
+  # ----------------------------------------------------------
+  
+  output$test_vars_ui <- renderUI({
+    req(input$test_type)
+    num <- types()$numeric
+    bin <- types()$binary
+    switch(
+      input$test_type,
+      "One-Sample t-test" = tagList(
+        selectInput("test_var", "Numeric variable:", num),
+        numericInput("test_mu", "Test value (\u03bc\u2080):", value = 0)),
+      "Independent Samples t-test" = tagList(
+        selectInput("test_var", "Numeric variable:", num),
+        selectInput("test_group", "Grouping variable (2 categories):", bin)),
+      "Paired t-test" = tagList(
+        selectInput("test_var1", "Variable 1:", num),
+        selectInput("test_var2", "Variable 2:", num, selected = num[2]))
+    )
+  })
+  
+  test_result <- eventReactive(input$test_run, {
+    df <- data()
+    type <- input$test_type
+    
+    if (type == "One-Sample t-test") {
+      validate(need(isTruthy(input$test_var), "Select a numeric variable."))
+      x <- as.numeric(df[[input$test_var]]); x <- x[is.finite(x)]
+      validate(need(length(x) >= 2, "At least 2 valid observations are required."))
+      tt <- t.test(x, mu = input$test_mu)
+      list(type = type, test = tt, label = input$test_var, mu = input$test_mu)
+      
+    } else if (type == "Independent Samples t-test") {
+      validate(need(isTruthy(input$test_var) && isTruthy(input$test_group),
+                    "Select a numeric variable and a two-category grouping variable."))
+      x <- as.numeric(df[[input$test_var]])
+      g <- df[[input$test_group]]
+      ok <- is.finite(x) & !is.na(g)
+      x <- x[ok]; g <- g[ok]
+      validate(need(length(unique(g)) == 2, "The grouping variable must have exactly two categories."))
+      validate(need(all(table(g) >= 2), "Each group needs at least 2 valid observations."))
+      tt <- t.test(x ~ g)
+      list(type = type, test = tt, label = input$test_var, group = input$test_group)
+      
+    } else {
+      validate(need(isTruthy(input$test_var1) && isTruthy(input$test_var2) &&
+                      !identical(input$test_var1, input$test_var2),
+                    "Select two different numeric variables."))
+      d <- df[complete.cases(df[c(input$test_var1, input$test_var2)]), ]
+      validate(need(nrow(d) >= 2, "At least 2 paired observations are required."))
+      tt <- t.test(d[[input$test_var1]], d[[input$test_var2]], paired = TRUE)
+      list(type = type, test = tt, label = paste(input$test_var1, "vs", input$test_var2))
+    }
+  })
+  
+  output$test_results_ui <- renderUI({
+    req(test_result())
+    panel_card("Test Results", tableOutput("test_table"),
+               h5("Interpretation"), uiOutput("test_interp"))
+  })
+  
+  output$test_table <- renderTable({
+    tt <- test_result()$test
+    data.frame(
+      Statistic = c("t", "df", "p-value", "95% CI Lower", "95% CI Upper",
+                    if (length(tt$estimate) == 2) c("Mean (Group 1)", "Mean (Group 2)")
+                    else "Mean / Mean Difference"),
+      Value = c(sprintf("%.4f", tt$statistic), sprintf("%.2f", tt$parameter),
+                format.pval(tt$p.value, digits = 4),
+                sprintf("%.4f", tt$conf.int[1]), sprintf("%.4f", tt$conf.int[2]),
+                sprintf("%.4f", tt$estimate))
+    )
+  })
+  
+  output$test_interp <- renderUI({
+    r <- test_result()
+    tt <- r$test
+    sig <- tt$p.value < 0.05
+    p_txt <- format.pval(tt$p.value, digits = 4)
+    msg <- switch(
+      r$type,
+      "One-Sample t-test" = sprintf(
+        "The mean of %s is %sstatistically different from %.4g (p = %s).",
+        r$label, if (sig) "" else "not ", r$mu, p_txt),
+      "Independent Samples t-test" = sprintf(
+        "%s is %sstatistically different between the two levels of %s (p = %s).",
+        r$label, if (sig) "" else "not ", r$group, p_txt),
+      "Paired t-test" = sprintf(
+        "The mean difference between the paired measurements is %sstatistically significant (p = %s).",
+        if (sig) "" else "not ", p_txt)
+    )
+    alert(if (sig) "warning" else "success", "t-test result:", msg)
+  })
+  
+  
+  # ----------------------------------------------------------
+  # ANOVA (one-way)
+  # ----------------------------------------------------------
+  
+  anova_model <- eventReactive(input$anova_run, {
+    num <- types()$numeric
+    cat <- types()$categorical
+    validate(need(length(num) >= 1 && length(cat) >= 1,
+                  "At least one numeric variable and one categorical variable are required."))
+    auto <- input$anova_mode == "automatic"
+    dv     <- if (auto) num[1] else input$anova_dv
+    factor_var <- if (auto) cat[1] else input$anova_factor
+    validate(need(isTruthy(dv) && isTruthy(factor_var),
+                  "Select a numeric variable and a categorical factor."))
+    validate(need(!identical(dv, factor_var),
+                  "The dependent variable and the factor must be different."))
+    
+    d <- data()[complete.cases(data()[c(dv, factor_var)]), c(dv, factor_var)]
+    d[[factor_var]] <- factor(d[[factor_var]])
+    validate(need(nlevels(d[[factor_var]]) >= 2, "The factor must have at least two levels."))
+    validate(need(all(table(d[[factor_var]]) >= 2), "Each group needs at least 2 observations."))
+    
+    f <- reformulate(factor_var, response = dv)
+    list(fit = aov(f, data = d), dv = dv, factor = factor_var, data = d)
+  })
+  
+  output$anova_results_ui <- renderUI({
+    req(anova_model())
+    tagList(
+      panel_card("ANOVA Table", tableOutput("anova_table"), uiOutput("anova_interp")),
+      panel_card("Tukey HSD Post-Hoc Comparisons", tableOutput("anova_tukey")),
+      panel_card("Group Distributions", plotOutput("anova_plot", height = "420px"))
+    )
+  })
+  
+  output$anova_table <- renderTable({
+    s <- summary(anova_model()$fit)[[1]]
+    out <- data.frame(Source = trimws(rownames(s)), s, row.names = NULL)
+    names(out) <- c("Source", "Df", "Sum Sq", "Mean Sq", "F value", "Pr(>F)")
+    out$`Pr(>F)` <- format.pval(out$`Pr(>F)`, digits = 4, eps = 1e-4)
+    out
+  }, digits = 4, na = "")
+  
+  output$anova_interp <- renderUI({
+    r <- anova_model()
+    p <- summary(r$fit)[[1]][["Pr(>F)"]][1]
+    if (is.na(p)) return(NULL)
+    sig <- p < 0.05
+    alert(if (sig) "warning" else "success", "Interpretation:",
+          sprintf("The mean of %s %s significantly across the levels of %s (p = %s).",
+                  r$dv, if (sig) "differs" else "does not differ significantly",
+                  r$factor, format.pval(p, digits = 4)))
+  })
+  
+  output$anova_tukey <- renderTable({
+    tk <- TukeyHSD(anova_model()$fit)[[1]]
+    out <- data.frame(Comparison = rownames(tk), tk, row.names = NULL)
+    names(out) <- c("Comparison", "Difference", "Lower CI", "Upper CI", "p adj")
+    out$`p adj` <- format.pval(out$`p adj`, digits = 4, eps = 1e-4)
+    out
+  }, digits = 4)
+  
+  output$anova_plot <- renderPlot({
+    r <- anova_model()
+    plot_chart("Boxplot", r$data, x = r$dv, group = r$factor)
   })
 }
 
